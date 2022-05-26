@@ -1,0 +1,10 @@
+.DS_Store
+/Manifest.toml
+/dev/
+
+.ipynb_checkpoints/
+*.swp
+
+output
+models
+*.log
