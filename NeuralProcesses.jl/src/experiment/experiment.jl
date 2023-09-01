@@ -7,7 +7,7 @@ using ..NeuralProcesses
 using BSON
 using CUDA
 using Flux
-using PyPlot
+#using PyPlot
 using Printf
 using ProgressMeter
 using Stheno

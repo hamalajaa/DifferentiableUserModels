@@ -15,6 +15,155 @@ import CUDA.CUDNN:
     cudnnGetConvolutionBackwardFilterWorkspaceSize, cudnnConvolutionBwdFilterAlgo_t
 import NNlib: depthwiseconv!, ∇depthwiseconv_filter!, ∇depthwiseconv_data!
 
+
+# Including the deprecated macros: https://github.com/JuliaGPU/CUDA.jl/blob/6485df512ca838db66bbd3ded15e7e8836744912/lib/utils/call.jl
+
+const CUDNNFloat = Union{Float16,Float32,Float64}
+
+mutable struct ConvDesc
+    ptr::cudnnConvolutionDescriptor_t
+end
+
+macro runtime_ccall(target, args...)
+    # decode ccall function/library target
+    Meta.isexpr(target, :tuple) || error("Expected (function_name, library) tuple")
+    function_name, library = target.args
+
+    # global const ref to hold the function pointer
+    @gensym fptr_cache
+    @eval __module__ begin
+        # uses atomics (release store, acquire load) for thread safety.
+        # see https://github.com/JuliaGPU/CUDAapi.jl/issues/106 for details
+        const $fptr_cache = Threads.Atomic{UInt}(0)
+    end
+
+    return quote
+        # use a closure to hold the lookup and avoid code bloat in the caller
+        @noinline function cache_fptr!()
+            library = Libdl.dlopen($(esc(library)))
+            $(esc(fptr_cache))[] = Libdl.dlsym(library, $(esc(function_name)))
+
+            $(esc(fptr_cache))[]
+        end
+
+        fptr = $(esc(fptr_cache))[]
+        if fptr == 0        # folded into the null check performed by ccall
+            fptr = cache_fptr!()
+        end
+
+        ccall(reinterpret(Ptr{Cvoid}, fptr), $(map(esc, args)...))
+    end
+
+    return
+end
+
+macro workspace(ex...)
+    code = ex[end]
+    kwargs = ex[1:end-1]
+
+    sz = nothing
+    eltyp = :UInt8
+    fallback = nothing
+    for kwarg in kwargs
+        key,val = kwarg.args
+        if key == :size
+            sz = val
+        elseif key == :eltyp
+            eltyp = val
+        elseif key == :fallback
+            fallback = val
+        else
+            throw(ArgumentError("Unsupported keyword argument '$key'"))
+        end
+    end
+
+    if sz === nothing
+        throw(ArgumentError("@workspace macro needs a size argument"))
+    end
+
+    # break down the closure to a let block to prevent JuliaLang/julia#15276
+    Meta.isexpr(code, :(->)) || throw(ArgumentError("@workspace macro should be applied to a closure"))
+    length(code.args) == 2 || throw(ArgumentError("@workspace closure should take exactly one argument"))
+    code_arg = code.args[1]
+    code = code.args[2]
+
+    return quote
+        sz = $(esc(sz))
+        workspace = nothing
+        try
+          while workspace === nothing || length(workspace) < sz
+              workspace = CuArray{$(esc(eltyp))}(undef, sz)
+              sz = $(esc(sz))
+          end
+        catch ex
+            $fallback === nothing && rethrow()
+            isa(ex, OutOfGPUMemoryError) || rethrow()
+            workspace = CuArray{UInt8}(undef, $fallback)
+        end
+
+        let $(esc(code_arg)) = workspace
+            ret = $(esc(code))
+            CUDA.unsafe_free!(workspace)
+            ret
+        end
+    end
+end
+
+macro argout(ex)
+    Meta.isexpr(ex, :call) || throw(ArgumentError("@argout macro should be applied to a function call"))
+
+    block = quote end
+
+    # look for output arguments (`out(...)`)
+    output_vars = []
+    args = ex.args[2:end]
+    for (i,arg) in enumerate(args)
+        if Meta.isexpr(arg, :call) && arg.args[1] == :out
+            # allocate a variable
+            @gensym output_val
+            push!(block.args, :($output_val = $(ex.args[i+1].args[2]))) # strip `output(...)`
+            push!(output_vars, output_val)
+
+            # replace the argument
+            ex.args[i+1] = output_val
+        end
+    end
+
+    # generate a return
+    push!(block.args, ex)
+    if isempty(output_vars)
+        push!(block.args, :(nothing))
+    elseif length(output_vars) == 1
+        push!(block.args, :($(output_vars[1])))
+    else
+        push!(block.args, :(tuple($(output_vars...))))
+    end
+
+    esc(block)
+end
+
+macro checked(ex)
+    # parse the function definition
+    @assert Meta.isexpr(ex, :function)
+    sig = ex.args[1]
+    @assert Meta.isexpr(sig, :call)
+    body = ex.args[2]
+    @assert Meta.isexpr(body, :block)
+
+    # generate a "safe" version that performs a check
+    safe_body = quote
+        @check $body
+    end
+    safe_sig = Expr(:call, sig.args[1], sig.args[2:end]...)
+    safe_def = Expr(:function, safe_sig, safe_body)
+
+    # generate a "unsafe" version that returns the error code instead
+    unsafe_sig = Expr(:call, Symbol("unsafe_", sig.args[1]), sig.args[2:end]...)
+    unsafe_def = Expr(:function, unsafe_sig, body)
+
+    return esc(:($safe_def, $unsafe_def))
+end
+
 const CuOrVector = Union{CuVector, Vector}
 const CuOrMatrix = Union{CuMatrix, Matrix}
 const CuOrArray = Union{CuArray, Array}
@@ -24,7 +173,6 @@ const CuOrArray = Union{CuArray, Array}
 diagonal(x::CuArray{T, 1}) where T<:Real = convert(CuArray, Diagonal(x))
 
 # Implement GPU support for depthwise separable convolutions.
-
 """
 @checked function cudnnGetConvolutionGroupCount(convDesc, count)
     @runtime_ccall(
@@ -46,7 +194,6 @@ end
     )
 end
 """
-
 function ConvDesc(T, cdims::DepthwiseConvDims)
     cd = Ref{cudnnConvolutionDescriptor_t}()
     CUDNN.cudnnCreateConvolutionDescriptor(cd)
